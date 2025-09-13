@@ -8,7 +8,9 @@ import feedparser
 from textblob import TextBlob
 
 SYMBOLS = ['TATAMOTORS.NS', 'HDFCBANK.NS', 'RELIANCE.NS', 'INFY.NS', 'SBIN.NS']
+
 LOOKBACK = '6mo'
+
 NEWS_FEEDS = [
     'https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms',
     'https://feeds.feedburner.com/ndtvprofit-latest'
@@ -57,4 +59,32 @@ def ensemble_predict(X_train, y_train, X_last):
 def smart_recommend():
     results = []
     for symbol in SYMBOLS:
-        X_train
+        X_train, X_test, y_train, y_test, y_actual, X_last, hist = prepare_data(symbol)
+        up_prob = ensemble_predict(X_train, y_train, X_last)
+        sentiment = get_sentiment_score(symbol.split('.')[0])
+        final_score = (
+            0.65 * up_prob
+            + 0.25 * (1 if sentiment > 0.05 else -1 if sentiment < -0.05 else 0)
+            + 0.1 * (1 if hist['Close'].iloc[-1] > hist['Open'].iloc[-1] else 0)
+        )
+        recommendation = 'BUY' if final_score >= 0.60 else 'HOLD' if 0.50 <= final_score < 0.60 else 'SELL'
+        confidence = min(99, round(abs(final_score) * 100, 2))
+        results.append({
+            'Stock': symbol.replace('.NS', ''),
+            'Signal': recommendation,
+            'Confidence %': confidence,
+            'ModelProb %': round(up_prob * 100, 1),
+            'Sentiment': round(sentiment, 3)
+        })
+    return sorted(results, key=lambda x: -x['Confidence %'])
+
+st.title("Smart Indian Stock Recommendation Demo (Free)")
+
+if st.button("Fetch Today's Recommendations"):
+    with st.spinner('Calculating signals and scores...'):
+        output = smart_recommend()
+        df = pd.DataFrame(output)
+        st.dataframe(df)
+        st.success("These are your AI-powered recommendations! Cross-verify with charts and news before trading.")
+
+st.caption("Run this app every morning before market open to get daily recommendations.")
