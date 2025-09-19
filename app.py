@@ -8,32 +8,32 @@ import feedparser
 from textblob import TextBlob
 import plotly.graph_objects as go
 
-# --- Custom CSS for improved design ---
+# -------- Custom CSS for neat UI --------
 st.markdown("""
 <style>
 body {
     font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
     background-color: #0e1117;
     color: #cdd9e5;
-    }
+}
 h1, h2, h3 {
     color: #58a6ff;
-    }
+}
 .stButton>button {
     background-color: #238636;
     color: white;
     border-radius: 8px;
     height: 3em;
     width: 100%;
-    }
+}
 .widget-label {
     font-weight: bold;
-    }
+}
 </style>
 """, unsafe_allow_html=True)
 
-# --- Constants ---
-TIME_FRAME = '90d'  # you can make this user selectable if needed
+# -------- Constants ---------
+TIME_FRAME = '90d'  # Default timeframe for price history
 
 @st.cache_data
 def fetch_stock_list():
@@ -53,11 +53,11 @@ def get_technical_features(df):
     df['vol_ma'] = df['Volume'].rolling(window=14).mean()
     df['atr'] = ta.volatility.AverageTrueRange(df['High'], df['Low'], df['Close']).average_true_range()
     df['obv'] = ta.volume.OnBalanceVolumeIndicator(df['Close'], df['Volume']).on_balance_volume()
+    df['stoch_rsi'] = ta.momentum.StochRSIIndicator(df['Close']).stochrsi()
     df.dropna(inplace=True)
     return df
 
 def get_fundamental_data(ticker):
-    """Fetch some basic fundamentals"""
     try:
         info = ticker.info
         pe = info.get('trailingPE', None)
@@ -75,7 +75,7 @@ def get_sentiment_score(stock_name):
     ]
     for url in news_feeds:
         feed = feedparser.parse(url)
-        for entry in feed.entries[:20]:
+        for entry in feed.entries[:10]:
             if stock_name.lower() in entry.title.lower() or stock_name.lower() in entry.summary.lower():
                 txt = entry.title + ' ' + entry.summary
                 score = TextBlob(txt).sentiment.polarity
@@ -88,7 +88,7 @@ def prepare_data(symbol):
     if hist.empty or len(hist) < 30:
         return None, None, None, None, None, None, None, None
     hist = get_technical_features(hist)
-    X = hist[['rsi', 'macd', 'bb_h', 'bb_l', 'vol_ma', 'atr', 'obv']]
+    X = hist[['rsi', 'macd', 'bb_h', 'bb_l', 'vol_ma', 'atr', 'obv', 'stoch_rsi']]
     y = np.where(hist['Close'].shift(-1) > hist['Close'], 1, 0)[:-1]
     split = int(len(X) * 0.8)
     X_train, X_test = X[:split], X[split:-1]
@@ -125,18 +125,18 @@ def plot_price_chart(hist, symbol):
     fig.update_layout(title=f'Price Chart: {symbol}', xaxis_title='Date', yaxis_title='Price')
     return fig
 
-# --- Main app ---
-
+# -------- App Layout ---------
 st.title("AI-Powered Stock Recommendations with Detailed Analysis")
 
 stock_list = fetch_stock_list()
 if len(stock_list) == 0:
     st.error("Stock list CSV missing or empty! Please upload a valid 'stocks_list.csv' file.")
     st.stop()
+
 st.markdown(f"Total stocks loaded: {len(stock_list)}")
 st.caption(f"Time frame for analysis: {TIME_FRAME}")
 
-# Dropdown for stock symbol input
+# Stock selector dropdown
 user_stock = st.selectbox("Select Stock Symbol:", options=stock_list)
 
 if user_stock:
@@ -156,49 +156,48 @@ if user_stock:
         signal = "BUY" if pred_prob > 0.6 else "HOLD" if pred_prob > 0.45 else "SELL"
         pe, mcap, div_yield = get_fundamental_data(ticker)
 
-        # Layout with tabs
-        tab1, tab2, tab3 = st.tabs(["Overview", "News & Sentiment", "Technicals"])
+        # Tabs for detailed analysis
+        tab1, tab2, tab3 = st.tabs(["Overview", "News & Sentiment", "Technical Indicators"])
 
         with tab1:
             st.markdown(f"### Signal: **{signal}**")
             st.write(f"Confidence: {pred_prob:.2%}")
-            st.write(f"Sentiment Score: {sentiment:.3f}")
-            st.write(f"Entry Price: ₹{entry_price:.2f}")
-            st.write(f"Exit Price (Target): ₹{exit_price:.2f}")
-            st.write(f"Expected Gain: {gain_pct:.2f}% (~₹{gain_amt:.2f})")
             st.write(f"P/E Ratio: {pe if pe is not None else 'N/A'}")
             st.write(f"Market Cap: {mcap if mcap is not None else 'N/A'}")
             st.write(f"Dividend Yield: {div_yield if div_yield is not None else 'N/A'}")
+            st.write(f"Entry Price: ₹{entry_price:.2f}")
+            st.write(f"Target Exit Price: ₹{exit_price:.2f}")
+            st.write(f"Expected Gain: {gain_pct:.2f}% (~₹{gain_amt:.2f})")
             st.plotly_chart(plot_price_chart(hist, user_stock), use_container_width=True)
 
         with tab2:
-            st.header("Recent News Highlights")
+            st.header("Recent News and Sentiment")
+            news_found = False
             news_feeds = [
                 'https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms',
                 'https://feeds.feedburner.com/ndtvprofit-latest'
             ]
-            news_listed = []
             for url in news_feeds:
                 feed = feedparser.parse(url)
                 for entry in feed.entries[:10]:
                     if user_stock.replace('.NS', '').lower() in entry.title.lower() or user_stock.replace('.NS', '').lower() in entry.summary.lower():
                         st.write(f"- [{entry.title}]({entry.link})")
-                        news_listed.append(entry)
-            if len(news_listed) == 0:
-                st.write("No significant recent news found.")
+                        news_found = True
+            if not news_found:
+                st.write("No recent news found.")
+
+            st.write(f"Sentiment score (news analysis): {sentiment:.3f}")
 
         with tab3:
             st.header("Technical Indicators")
-            st.line_chart(hist[['rsi', 'macd', 'obv']])
-            st.write("ATR values (volatility measure)")
-            st.line_chart(hist['atr'])
+            st.line_chart(hist[['rsi', 'macd', 'obv', 'atr', 'stoch_rsi']])
 
-# Top 5 Daily Buy Recommendations Section
+# Top 5 buy recommendations table
 st.markdown("---")
 st.markdown("## Top 5 Daily Buy Recommendations")
 
 recommendations = []
-for symbol in stock_list[:100]:  # limit for performance
+for symbol in stock_list[:100]:
     X_train, X_test, y_train, y_test, y_actual, X_last, hist, ticker = prepare_data(symbol)
     if X_train is None or len(X_train) < 5 or X_last is None:
         continue
@@ -223,7 +222,7 @@ if len(sorted_recs) == 0:
     st.info("No strong buy recommendations currently.")
 else:
     df_recs = pd.DataFrame(sorted_recs).drop(columns=['Confidence'])
-    selected_stock = st.selectbox("Select stock for detailed report", options=df_recs['Stock'])
+    selected_stock = st.selectbox("Select stock from recommendations for detailed analysis:", options=df_recs['Stock'])
 
     st.dataframe(df_recs.style.format({
         "Entry Price": "₹{:.2f}",
@@ -233,23 +232,23 @@ else:
         "Accuracy %": "{:.2f}%"
     }))
 
-    # Display detailed report for the selected recommendation
-    sym_ns = selected_stock + '.NS'
-    X_train, X_test, y_train, y_test, y_actual, X_last, hist, ticker = prepare_data(sym_ns)
-    if hist is not None:
-        sentiment = get_sentiment_score(selected_stock)
-        pred_prob = ensemble_predict(X_train, y_train, X_last)
+    if selected_stock:
+        sym_ns = selected_stock + '.NS'
+        X_train, X_test, y_train, y_test, y_actual, X_last, hist, ticker = prepare_data(sym_ns)
+        if hist is not None:
+            sentiment = get_sentiment_score(selected_stock)
+            pred_prob = ensemble_predict(X_train, y_train, X_last)
 
-        st.markdown(f"### Detailed Report: {selected_stock}")
-        st.write(f"Sentiment score: {sentiment:.3f}")
-        st.write(f"Prediction confidence: {pred_prob:.2%}")
-        st.plotly_chart(plot_price_chart(hist, sym_ns), use_container_width=True)
-        st.line_chart(hist[['rsi', 'macd', 'obv', 'atr']])
-        pe, mcap, div_yield = get_fundamental_data(ticker)
-        st.write(f"P/E Ratio: {pe if pe is not None else 'N/A'}")
-        st.write(f"Market Cap: {mcap if mcap is not None else 'N/A'}")
-        st.write(f"Dividend Yield: {div_yield if div_yield is not None else 'N/A'}")
-    else:
-        st.warning("No detailed data for this stock.")
+            st.markdown(f"### Detailed Report: {selected_stock}")
+            st.write(f"Sentiment score: {sentiment:.3f}")
+            st.write(f"Prediction confidence: {pred_prob:.2%}")
+            st.plotly_chart(plot_price_chart(hist, sym_ns), use_container_width=True)
+            st.line_chart(hist[['rsi', 'macd', 'obv', 'atr', 'stoch_rsi']])
+            pe, mcap, div_yield = get_fundamental_data(ticker)
+            st.write(f"P/E Ratio: {pe if pe is not None else 'N/A'}")
+            st.write(f"Market Cap: {mcap if mcap is not None else 'N/A'}")
+            st.write(f"Dividend Yield: {div_yield if div_yield is not None else 'N/A'}")
+        else:
+            st.warning("No detailed data for this stock.")
 
 st.caption("Disclaimer: For educational purposes only. Always cross-check before trading.")
