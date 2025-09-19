@@ -8,14 +8,13 @@ import feedparser
 from textblob import TextBlob
 import plotly.graph_objects as go
 
-# Load stock list only from local CSV
 @st.cache_data
 def fetch_stock_list():
     try:
         df = pd.read_csv("stocks_list.csv")
         return df['SYMBOL'].tolist()
     except Exception as e:
-        st.error(f"Failed to load stock list: {e}")
+        st.error(f"Failed to load stock list CSV: {e}")
         return []
 
 def get_technical_features(df):
@@ -57,13 +56,17 @@ def prepare_data(symbol):
     return X_train, X_test, y_train, y_test, y[-1], X.iloc[-1], hist
 
 def ensemble_predict(X_train, y_train, X_last):
-    if X_train is None or len(X_train) == 0:
+    if X_train is None or len(X_train) == 0 or X_last is None:
         return 0.5
     rf = RandomForestClassifier(n_estimators=100, random_state=42)
     rf.fit(X_train, y_train)
     ensemble = VotingClassifier(estimators=[('rf', rf)], voting='soft')
     ensemble.fit(X_train, y_train)
-    return ensemble.predict_proba([X_last])[0][1]
+    proba = ensemble.predict_proba([X_last])[0]
+    if len(proba) > 1:
+        return proba[1]
+    else:
+        return 0.5
 
 def project_price_targets(hist, entry_price):
     exit_price = entry_price * 1.05
@@ -80,7 +83,6 @@ if len(stock_list) == 0:
 
 st.markdown(f"Total stocks loaded: {len(stock_list)}")
 
-# Use a dropdown to select stock symbol
 user_stock = st.selectbox("Select Stock Symbol:", options=stock_list)
 
 if user_stock:
@@ -91,7 +93,7 @@ if user_stock:
         st.error("Insufficient historical data for this stock.")
         st.write("Try another stock or check your internet connection/Data availability from Yahoo Finance API.")
     else:
-        st.write(f"Historical data rows fetched: {len(hist)}")  # Debug info
+        st.write(f"Historical data rows fetched: {len(hist)}")
 
         pred_prob = ensemble_predict(X_train, y_train, X_last)
         sentiment = get_sentiment_score(user_stock.replace('.NS', ''))
@@ -106,7 +108,6 @@ if user_stock:
         st.write(f"Exit Price (Target): ₹{exit_price:.2f}")
         st.write(f"Expected Gain: {gain_pct:.2f}% (~₹{gain_amt:.2f})")
 
-        # Price Chart
         fig = go.Figure()
         fig.add_trace(go.Candlestick(
             x=hist.index,
@@ -123,9 +124,9 @@ st.markdown("---")
 st.markdown("## Top 5 Daily Buy Recommendations")
 
 recommendations = []
-for symbol in stock_list[:100]:  # Limit for demo speed; increase if needed
+for symbol in stock_list[:100]:
     X_train, X_test, y_train, y_test, y_actual, X_last, hist = prepare_data(symbol)
-    if X_train is None:
+    if X_train is None or len(X_train) < 5 or X_last is None:
         continue
     prob_up = ensemble_predict(X_train, y_train, X_last)
     accuracy = max(80, round(85 + 10 * (prob_up - 0.5), 2))
@@ -158,7 +159,6 @@ else:
         "Accuracy %": "{:.2f}%"
     }))
 
-    # Detailed report for selected stock
     sym_ns = selected_stock + '.NS'
     X_train, X_test, y_train, y_test, y_actual, X_last, hist = prepare_data(sym_ns)
     if hist is not None:
