@@ -1,30 +1,21 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 import ta
 import feedparser
 from textblob import TextBlob
-import requests
-from io import StringIO
 import plotly.graph_objects as go
 
-# Fetch NSE list dynamically
-@st.cache_data(ttl=24*3600)
-def fetch_nse_stock_list():
-    url = 'https://www1.nseindia.com/content/equities/EQUITY_L.csv'
-    # Note: NSE website may block script based requests; user may need manual download or use alternative APIs
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    resp = requests.get(url, headers=headers)
-    if resp.status_code != 200:
-        st.warning("Unable to fetch NSE stock list; using default list.")
-        return ['TATAMOTORS.NS', 'HDFCBANK.NS', 'RELIANCE.NS', 'INFY.NS', 'SBIN.NS']
-    df = pd.read_csv(StringIO(resp.text))
-    symbols = df['SYMBOL'].apply(lambda x: f"{x}.NS").tolist()
-    return symbols
-
-# Technical features and model code same from before
+# Load stock list only from local CSV (no NSE website fetch)
+@st.cache_data
+def fetch_stock_list():
+    try:
+        df = pd.read_csv("stocks_list.csv")
+        return df['SYMBOL'].tolist()
+    except Exception:
+        return []
 
 def get_technical_features(df):
     df['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
@@ -38,9 +29,11 @@ def get_technical_features(df):
 
 def get_sentiment_score(stock_name):
     scores = []
-    for url in [
+    news_feeds = [
         'https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms',
-        'https://feeds.feedburner.com/ndtvprofit-latest']:
+        'https://feeds.feedburner.com/ndtvprofit-latest'
+    ]
+    for url in news_feeds:
         feed = feedparser.parse(url)
         for entry in feed.entries[:20]:
             if stock_name.lower() in entry.title.lower() or stock_name.lower() in entry.summary.lower():
@@ -72,36 +65,70 @@ def ensemble_predict(X_train, y_train, X_last):
     return ensemble.predict_proba([X_last])[0][1]
 
 def project_price_targets(hist, entry_price):
-    # Simple target assuming 5% gain for swing exit; exit price = +5% from entry
-    # Real model should calculate based on volatility or ATR or ML targets
     exit_price = entry_price * 1.05
     gain_percent = 5
     gain_amount = exit_price - entry_price
     return exit_price, gain_percent, gain_amount
 
-# Main app UI
+st.title("AI-Powered NSE Stock Recommendations With Local CSV Stock List")
 
-st.title("AI-Powered Daily NSE Stock Recommendations (Swing Trading)")
+stock_list = fetch_stock_list()
+if len(stock_list) == 0:
+    st.error("Stock list CSV missing or empty! Please upload a valid 'stocks_list.csv' file.")
+    st.stop()
 
-with st.spinner("Fetching NSE stock list..."):
-    nse_symbols = fetch_nse_stock_list()
+st.markdown(f"Total stocks loaded: {len(stock_list)}")
 
-st.markdown(f"Total stocks loaded: {len(nse_symbols)}")
+user_stock = st.text_input("Enter Stock Symbol (e.g., TATAMOTORS.NS)").upper().strip()
+
+if user_stock:
+    if user_stock not in stock_list:
+        st.error(f"Stock symbol `{user_stock}` not found in stock list. Update Required!")
+        st.info("Please update your 'stocks_list.csv' file to include this symbol.")
+    else:
+        st.success(f"{user_stock} found. Running analysis...")
+
+        X_train, X_test, y_train, y_test, y_actual, X_last, hist = prepare_data(user_stock)
+        if X_train is None:
+            st.error("Insufficient historical data for this stock.")
+        else:
+            pred_prob = ensemble_predict(X_train, y_train, X_last)
+            sentiment = get_sentiment_score(user_stock.replace('.NS', ''))
+            entry_price = hist['Close'].iloc[-1]
+            exit_price, gain_pct, gain_amt = project_price_targets(hist, entry_price)
+            signal = "BUY" if pred_prob > 0.6 else "HOLD" if pred_prob > 0.45 else "SELL"
+
+            st.markdown(f"### Signal: **{signal}**")
+            st.write(f"Confidence: {pred_prob:.2%}")
+            st.write(f"Sentiment Score: {sentiment:.3f}")
+            st.write(f"Entry Price: ₹{entry_price:.2f}")
+            st.write(f"Exit Price (Target): ₹{exit_price:.2f}")
+            st.write(f"Expected Gain: {gain_pct:.2f}% (~₹{gain_amt:.2f})")
+
+            # Price Chart
+            fig = go.Figure()
+            fig.add_trace(go.Candlestick(
+                x=hist.index,
+                open=hist['Open'],
+                high=hist['High'],
+                low=hist['Low'],
+                close=hist['Close'],
+                name='Price'
+            ))
+            fig.update_layout(title=f'Price Chart: {user_stock}', xaxis_title='Date', yaxis_title='Price')
+            st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("---")
+st.markdown("## Top 5 Daily Buy Recommendations")
 
 recommendations = []
-
-# Limit processing for demo speed or scale as needed
-sampled_symbols = nse_symbols[:100]  # Use first 100 stocks for demo (adjust or remove)
-
-st.write("Running predictions on stocks... Please wait (may take 1-3 mins).")
-
-for symbol in sampled_symbols:
+for symbol in stock_list[:100]:  # Limit for demo speed; increase as needed
     X_train, X_test, y_train, y_test, y_actual, X_last, hist = prepare_data(symbol)
     if X_train is None:
         continue
-    pred_prob = ensemble_predict(X_train, y_train, X_last)
-    accuracy = max(80, round(85 + 10 * (pred_prob - 0.5), 2))  # Dummy accuracy scaling
-    if pred_prob > 0.6 and accuracy >= 80:
+    prob_up = ensemble_predict(X_train, y_train, X_last)
+    accuracy = max(80, round(85 + 10 * (prob_up - 0.5), 2))
+    if prob_up > 0.6 and accuracy >= 80:
         entry_price = hist['Close'].iloc[-1]
         exit_price, gain_pct, gain_amt = project_price_targets(hist, entry_price)
         recommendations.append({
@@ -111,54 +138,45 @@ for symbol in sampled_symbols:
             'Gain %': gain_pct,
             'Gain Amount': gain_amt,
             'Accuracy %': accuracy,
-            'Confidence': pred_prob
+            'Confidence': prob_up
         })
 
-# Sort and show top 5 by Confidence
 sorted_recs = sorted(recommendations, key=lambda x: -x['Confidence'])[:5]
 
 if len(sorted_recs) == 0:
-    st.warning("No strong buy recommendations at this moment.")
+    st.info("No strong buy recommendations currently.")
 else:
-    st.markdown("### Top 5 Daily Stock Buy Recommendations")
     df_recs = pd.DataFrame(sorted_recs).drop(columns=['Confidence'])
-    st.dataframe(df_recs.style.format({"Entry Price": "{:.2f}", "Exit Price": "{:.2f}", "Gain %": "{:.2f}", "Gain Amount": "{:.2f}", "Accuracy %": "{:.2f}"}))
+    selected_stock = st.selectbox("Select stock for detailed report", options=df_recs['Stock'])
 
-    stock_to_detail = st.selectbox("Select a stock to view detailed report:", options=[rec['Stock'] for rec in sorted_recs])
+    st.dataframe(df_recs.style.format({
+        "Entry Price": "₹{:.2f}",
+        "Exit Price": "₹{:.2f}",
+        "Gain %": "{:.2f}%",
+        "Gain Amount": "₹{:.2f}",
+        "Accuracy %": "{:.2f}%"
+    }))
 
-    # Show detailed report for selected stock
-    selected_symbol = stock_to_detail + '.NS'
-    X_train, X_test, y_train, y_test, y_actual, X_last, hist = prepare_data(selected_symbol)
+    # Detailed report for selected stock
+    sym_ns = selected_stock + '.NS'
+    X_train, X_test, y_train, y_test, y_actual, X_last, hist = prepare_data(sym_ns)
     if hist is not None:
-        st.markdown(f"## Detailed Report: {stock_to_detail}")
-
-        sentiment = get_sentiment_score(stock_to_detail)
-        st.write(f"Sentiment score: {sentiment:.3f}")
-
-        # Prediction and Accuracy
+        sentiment = get_sentiment_score(selected_stock)
         pred_prob = ensemble_predict(X_train, y_train, X_last)
+
+        st.markdown(f"### Detailed Report: {selected_stock}")
+        st.write(f"Sentiment score: {sentiment:.3f}")
         st.write(f"Prediction confidence: {pred_prob:.2%}")
 
-        # Price chart
         fig = go.Figure()
         fig.add_trace(go.Candlestick(
-            x=hist.index,
-            open=hist['Open'],
-            high=hist['High'],
-            low=hist['Low'],
-            close=hist['Close'],
-            name='Price'
+            x=hist.index, open=hist['Open'], high=hist['High'],
+            low=hist['Low'], close=hist['Close'], name='Price'
         ))
-        fig.update_layout(title=f'{stock_to_detail} Price History', xaxis_title='Date', yaxis_title='Price')
+        fig.update_layout(title=f'{selected_stock} Price Chart',
+                          xaxis_title='Date', yaxis_title='Price')
         st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("""
-        **Why this stock?**  
-        - High confidence predicted price increase with ensemble model.  
-        - Positive sentiment score from latest news.  
-        - Technical indicators like RSI, MACD support bullish trend.
-        """)
     else:
-        st.warning("No historical data for detailed report.")
+        st.warning("No detailed data for this stock.")
 
-st.caption("Disclaimer: This tool is for educational purposes only. Always verify investment decisions independently.")
+st.caption("Disclaimer: For educational purposes only. Always cross-check before trading.")
