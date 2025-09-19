@@ -8,7 +8,7 @@ import feedparser
 from textblob import TextBlob
 import plotly.graph_objects as go
 
-# -------- Custom CSS for neat UI --------
+# Custom CSS
 st.markdown("""
 <style>
 body {
@@ -32,8 +32,7 @@ h1, h2, h3 {
 </style>
 """, unsafe_allow_html=True)
 
-# -------- Constants ---------
-TIME_FRAME = '90d'  # Default timeframe for price history
+TIME_FRAME = '90d'
 
 @st.cache_data
 def fetch_stock_list():
@@ -93,7 +92,18 @@ def prepare_data(symbol):
     split = int(len(X) * 0.8)
     X_train, X_test = X[:split], X[split:-1]
     y_train, y_test = y[:split], y[split:-1]
-    return X_train, X_test, y_train, y_test, y[-1], X.iloc[-1], hist, ticker
+
+    # Defensive validation against empty sets
+    if len(y) == 0 or len(X) == 0 or len(X_train) == 0 or len(X_test) == 0 or len(y_train) == 0 or len(y_test) == 0:
+        return None, None, None, None, None, None, None, None
+
+    try:
+        y_actual = y[-1]
+        X_last = X.iloc[-1]
+    except Exception:
+        return None, None, None, None, None, None, None, None
+
+    return X_train, X_test, y_train, y_test, y_actual, X_last, hist, ticker
 
 def ensemble_predict(X_train, y_train, X_last):
     if X_train is None or len(X_train) == 0 or X_last is None:
@@ -125,7 +135,6 @@ def plot_price_chart(hist, symbol):
     fig.update_layout(title=f'Price Chart: {symbol}', xaxis_title='Date', yaxis_title='Price')
     return fig
 
-# -------- App Layout ---------
 st.title("AI-Powered Stock Recommendations with Detailed Analysis")
 
 stock_list = fetch_stock_list()
@@ -136,7 +145,6 @@ if len(stock_list) == 0:
 st.markdown(f"Total stocks loaded: {len(stock_list)}")
 st.caption(f"Time frame for analysis: {TIME_FRAME}")
 
-# Stock selector dropdown
 user_stock = st.selectbox("Select Stock Symbol:", options=stock_list)
 
 if user_stock:
@@ -156,7 +164,6 @@ if user_stock:
         signal = "BUY" if pred_prob > 0.6 else "HOLD" if pred_prob > 0.45 else "SELL"
         pe, mcap, div_yield = get_fundamental_data(ticker)
 
-        # Tabs for detailed analysis
         tab1, tab2, tab3 = st.tabs(["Overview", "News & Sentiment", "Technical Indicators"])
 
         with tab1:
@@ -185,14 +192,12 @@ if user_stock:
                         news_found = True
             if not news_found:
                 st.write("No recent news found.")
-
             st.write(f"Sentiment score (news analysis): {sentiment:.3f}")
 
         with tab3:
             st.header("Technical Indicators")
             st.line_chart(hist[['rsi', 'macd', 'obv', 'atr', 'stoch_rsi']])
 
-# Top 5 buy recommendations table
 st.markdown("---")
 st.markdown("## Top 5 Daily Buy Recommendations")
 
