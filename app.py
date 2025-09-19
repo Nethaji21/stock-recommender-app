@@ -5,7 +5,7 @@ import yfinance as yf
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 import ta
 import feedparser
-from textblob import TextBlobs
+from textblob import TextBlob
 import plotly.graph_objects as go
 
 # --- Custom CSS for improved design ---
