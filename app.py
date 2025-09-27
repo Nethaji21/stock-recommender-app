@@ -8,7 +8,6 @@ import feedparser
 from textblob import TextBlob
 import plotly.graph_objects as go
 
-# Custom CSS for better design
 st.markdown("""
 <style>
 body {
@@ -62,7 +61,6 @@ def detect_candlestick_patterns(df):
     last = df.iloc[-1]
     if last['body'] <= 0.1 * last['range']:
         patterns.append('Doji')
-    # Add more patterns if needed
     return patterns
 
 def prepare_data(symbol):
@@ -222,7 +220,7 @@ else:
         sym_ns = selected_rec_stock + '.NS'
         X_train, X_test, y_train, y_test, y_actual, X_last, hist, ticker = prepare_data(sym_ns)
         if hist is not None:
-            sentiment = get_sentiment_score(selected_rec_stock)
+            sentiment = get_sentiment_score(selected_rec_stock.replace('.NS', ''))
             pred_prob = ensemble_predict(X_train, y_train, X_last)
             patterns = detect_candlestick_patterns(hist)
 
