@@ -41,6 +41,21 @@ def fetch_stock_list():
     except:
         return []
 
+def get_sentiment_score(stock_name):
+    scores = []
+    news_feeds = [
+        'https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms',
+        'https://feeds.feedburner.com/ndtvprofit-latest'
+    ]
+    for url in news_feeds:
+        feed = feedparser.parse(url)
+        for entry in feed.entries[:10]:
+            if stock_name.lower() in entry.title.lower() or stock_name.lower() in entry.summary.lower():
+                txt = entry.title + ' ' + entry.summary
+                score = TextBlob(txt).sentiment.polarity
+                scores.append(score)
+    return np.mean(scores) if scores else 0
+
 def get_technical_features(df):
     df['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
     df['macd'] = ta.trend.MACD(df['Close']).macd_diff()
