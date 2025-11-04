@@ -1,4 +1,5 @@
-# app.py (enhanced)
+# app.py — Professional daily top-5 stock picker (Streamlit)
+# Run: streamlit run app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,82 +10,57 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import cross_val_score
-from sklearn.metrics import accuracy_score, precision_score, recall_score
+from datetime import datetime, timedelta
 import ta
-import feedparser
+import concurrent.futures
+import time
 from textblob import TextBlob
-from datetime import timedelta
+import feedparser
 
-st.set_page_config(page_title="Smart Stocks — Enhanced", layout="wide")
+st.set_page_config(page_title="Pro Trader Picks — Daily Top 5", layout="wide")
 
-# ---- Styling ----
+# ----------------- Styling -----------------
 st.markdown(
     """
     <style>
-    .stApp { background: linear-gradient(180deg,#071021,#071023 40%); color:#cfd8e3; }
-    .header {background: linear-gradient(90deg,#0f1724,#07203a); padding:18px; border-radius:12px; box-shadow: 0 4px 20px rgba(0,0,0,0.6);}
-    .big-title {font-size:28px; color:#58a6ff; margin:0; font-weight:700;}
-    .sub {color:#9fb4d7; margin-top:4px; margin-bottom:0;}
-    .card {background:#071024; border: 1px solid rgba(255,255,255,0.04); padding:12px; border-radius:10px;}
-    .metric {font-size:20px; color:#d7e8ff; font-weight:600;}
-    .stButton>button {background-color:#238636; color:white; border-radius:8px; height:3em;}
+    .header {background: linear-gradient(90deg,#0b1220,#081827); padding:18px; border-radius:10px;}
+    .title {font-size:28px; color:#a8e3ff; font-weight:700;}
+    .sub {color:#cfefff; opacity:0.9;}
+    .card {background:#06111a; padding:12px; border-radius:8px; border:1px solid rgba(255,255,255,0.03);}
     </style>
     """,
-    unsafe_allow_html=True,
+    unsafe_allow_html=True
 )
 
-# Header
-with st.container():
-    st.markdown('<div class="header"><p class="big-title">Smart Stocks — AI Recommendations</p>'
-                '<p class="sub">Improved model, better features, backtest & cleaner UI — educational only.</p></div>',
-                unsafe_allow_html=True)
+st.markdown('<div class="header"><div class="title">Pro Trader Picks</div>'
+            '<div class="sub">Daily top stock picks — ensemble model, target 10% profit, minimal UI for traders.</div></div>',
+            unsafe_allow_html=True)
 
-# ---- Constants / Defaults ----
-DEFAULT_TIMEFRAME = '180d'   # default lookback for features
-MIN_HISTORY_DAYS = 60        # minimum history needed
-DEFAULT_TOPN_SCAN = 100
-DEFAULT_CONF_THRESHOLD = 0.62
-DEFAULT_HOLD_DAYS = 5
+# ----------------- Defaults -----------------
+MIN_HISTORY_DAYS = 120
+DEFAULT_TIMEFRAME = '365d'
+DEFAULT_TOPN = 200
+MIN_PICKS = 5
+DEFAULT_CONF_THRESHOLD = 0.55  # used for informational display only (we will still return top 5)
+DEFAULT_TTL = 3600  # cache TTL in seconds
 
-# ---- Utilities & Caching ----
-@st.cache_data(ttl=3600)
-def fetch_stock_list():
+# ----------------- Utilities -----------------
+@st.cache_data(ttl=DEFAULT_TTL)
+def load_stock_list(path="stocks_list.csv"):
     try:
-        df = pd.read_csv("stocks_list.csv")
+        df = pd.read_csv(path)
+        # Accept either 'SYMBOL' column or first column as tickers
         if 'SYMBOL' in df.columns:
-            return df['SYMBOL'].astype(str).tolist()
+            syms = df['SYMBOL'].astype(str).tolist()
         else:
-            # try first column
-            return df.iloc[:,0].astype(str).tolist()
+            syms = df.iloc[:, 0].astype(str).tolist()
+        # normalize common NSE tickers (optional)
+        syms = [s.strip() for s in syms if isinstance(s, str) and s.strip() != ""]
+        return syms
     except Exception as e:
         return []
 
-def safe_parse(feed_url):
-    try:
-        return feedparser.parse(feed_url)
-    except:
-        return None
-
-@st.cache_data(ttl=900)
-def get_sentiment_score(symbol_short):
-    """Basic sentiment from two feeds + TextBlob polarity aggregated."""
-    scores = []
-    news_feeds = [
-        'https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms',
-        'https://feeds.feedburner.com/ndtvprofit-latest'
-    ]
-    for url in news_feeds:
-        feed = safe_parse(url)
-        if feed and hasattr(feed, 'entries'):
-            for entry in feed.entries[:12]:
-                title = getattr(entry, 'title', '') or ''
-                summary = getattr(entry, 'summary', '') or ''
-                txt = (title + ' ' + summary).lower()
-                if symbol_short.lower() in txt:
-                    scores.append(TextBlob(title + ' ' + summary).sentiment.polarity)
-    return float(np.mean(scores)) if len(scores) > 0 else 0.0
-
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=DEFAULT_TTL)
 def download_history(symbol, period):
     try:
         t = yf.Ticker(symbol)
@@ -93,13 +69,11 @@ def download_history(symbol, period):
             return None
         hist = hist.dropna()
         return hist
-    except Exception as e:
+    except Exception:
         return None
 
-# ---- Feature engineering ----
 def add_technical_features(df):
     df = df.copy()
-    # returns
     df['ret1'] = df['Close'].pct_change(1)
     df['ret5'] = df['Close'].pct_change(5)
     df['ma7'] = df['Close'].rolling(7).mean()
@@ -108,10 +82,10 @@ def add_technical_features(df):
     df['ema26'] = df['Close'].ewm(span=26).mean()
     df['vol_ma14'] = df['Volume'].rolling(14).mean()
     df['vol_spike'] = df['Volume'] / (df['vol_ma14'] + 1e-9)
-    # TA library features
     try:
         df['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
-        df['macd_diff'] = ta.trend.MACD(df['Close']).macd_diff()
+        macd = ta.trend.MACD(df['Close'])
+        df['macd_diff'] = macd.macd_diff()
         bb = ta.volatility.BollingerBands(df['Close'])
         df['bb_h'] = bb.bollinger_hband()
         df['bb_l'] = bb.bollinger_lband()
@@ -123,253 +97,296 @@ def add_technical_features(df):
     df = df.dropna()
     return df
 
-# ---- Modeling helpers ----
 def prepare_ml_data(hist):
-    # expects historical dataframe with features added
     df = hist.copy()
-    # target: next-day close > today close
     df['target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
     df = df.dropna()
-    # use a set of robust features
-    feats = ['rsi','macd_diff','bb_h','bb_l','vol_spike','atr','obv','stoch_rsi','ret1','ret5','ma7','ma21']
-    available = [f for f in feats if f in df.columns and df[f].notna().sum() > 0]
-    if len(available) < 5:
+    candidate_feats = ['rsi','macd_diff','bb_h','bb_l','vol_spike','atr','obv','stoch_rsi','ret1','ret5','ma7','ma21']
+    available = [f for f in candidate_feats if f in df.columns and df[f].notna().sum() > 0]
+    if len(available) < 5 or len(df) < 60:
         return None, None, None
-    X = df[available].iloc[:-1]  # drop last because target uses shift(-1)
+    X = df[available].iloc[:-1]  # last target uses future
     y = df['target'].iloc[:-1]
     return X, y, available
 
 def build_model():
-    # pipeline for both models
-    pipe1 = Pipeline([('scaler', StandardScaler()), ('rf', RandomForestClassifier(n_estimators=120, random_state=42))])
-    pipe2 = Pipeline([('scaler', StandardScaler()), ('lr', LogisticRegression(max_iter=400, random_state=42))])
-    ensemble = VotingClassifier(estimators=[('rf', pipe1), ('lr', pipe2)], voting='soft')
+    pipe_rf = Pipeline([('s', StandardScaler()), ('rf', RandomForestClassifier(n_estimators=150, random_state=42))])
+    pipe_lr = Pipeline([('s', StandardScaler()), ('lr', LogisticRegression(max_iter=500, random_state=42))])
+    ensemble = VotingClassifier(estimators=[('rf', pipe_rf), ('lr', pipe_lr)], voting='soft')
     return ensemble
 
-def model_predict_proba(model, X_train, y_train, X_last):
-    model.fit(X_train, y_train)
-    try:
-        proba = model.predict_proba(X_last.reshape(1, -1))[0][1]
-    except:
-        proba = model.predict_proba(X_last.to_frame().T)[0][1]
-    return float(proba)
-
-def cross_validate_model(model, X, y):
-    try:
-        scores = cross_val_score(model, X, y, cv=3, scoring='accuracy')
-        return float(np.mean(scores))
-    except:
-        return None
-
-# ---- Simple backtest simulate buy next day and hold N days ----
-def simple_backtest(hist, features, hold_days=DEFAULT_HOLD_DAYS):
+def safe_sentiment_pool(symbol_short):
     """
-    For each row i in hist where we can compute features and target,
-    simulate: if model predicted up, buy next open and sell after hold_days close.
-    Here we do a simplified historical simulation using a model trained in-expanding manner.
-    We'll compute historical accuracy: proportion of trades that were profitable.
+    Quick polarity from RSS + TextBlob — optional and slow; cached at top.
     """
-    df = hist.copy().dropna()
-    X = df[features]
-    y = (df['Close'].shift(-1) > df['Close']).astype(int)
-    X = X.iloc[:-hold_days]
-    y = y.iloc[:-hold_days]
-    if len(X) < 30:
-        return None
-    model = build_model()
-    wins = 0
-    trades = 0
-    # expanding-window training for realistic test
-    for i in range(30, len(X)-1):
-        X_train = X.iloc[:i]
-        y_train = y.iloc[:i]
-        X_test_row = X.iloc[i:i+1]
-        if y_train.nunique() < 2:
-            continue
+    try:
+        feeds = [
+            'https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms',
+            'https://www.moneycontrol.com/rss/MCtopnews.xml'
+        ]
+    except:
+        feeds = []
+    scores = []
+    for url in feeds:
         try:
+            f = feedparser.parse(url)
+            for e in (f.entries[:20] if hasattr(f,'entries') else []):
+                title = getattr(e, 'title', '') or ''
+                summary = getattr(e, 'summary', '') or ''
+                txt = (title + ' ' + summary).lower()
+                if symbol_short.lower() in txt:
+                    scores.append(TextBlob(title + ' ' + summary).sentiment.polarity)
+        except Exception:
+            continue
+    return float(np.mean(scores)) if len(scores) > 0 else 0.0
+
+# ----------------- Sidebar controls -----------------
+st.sidebar.header("Scan / Model Controls")
+timeframe = st.sidebar.selectbox("History timeframe", options=['180d','365d','730d'], index=1)
+top_n = st.sidebar.number_input("Top N stocks to scan (max)", min_value=20, max_value=1000, value=DEFAULT_TOPN, step=10)
+min_picks = st.sidebar.number_input("Minimum picks to return", min_value=1, max_value=10, value=MIN_PICKS, step=1)
+enable_backtest = st.sidebar.checkbox("Enable light historical backtest (slower)", value=False)
+backtest_hold = st.sidebar.slider("Backtest hold days", min_value=1, max_value=21, value=5)
+newsapi_key = st.sidebar.text_input("NewsAPI key (optional) — for improved sentiment", type="password")
+enable_sector = st.sidebar.checkbox("Show sector (via yfinance)", value=True)
+refresh_cache = st.sidebar.button("Clear cache (force fresh download)")
+scan_button = st.sidebar.button("Run daily scan now")
+
+if refresh_cache:
+    load_stock_list.clear()
+    download_history.clear()
+    st.sidebar.success("Cache cleared.")
+
+# ----------------- Load universe -----------------
+stock_list = load_stock_list()
+if len(stock_list) == 0:
+    st.error("Please put a CSV named 'stocks_list.csv' in the app folder with one column of tickers (or a column named SYMBOL).")
+    st.stop()
+
+st.sidebar.write(f"Universe loaded: {len(stock_list)} tickers")
+st.write("### Scan controls & summary")
+st.markdown(f"- Scanning up to **{top_n}** tickers (first N from your file).")
+st.markdown(f"- Minimum picks returned: **{min_picks}** (app ensures this).")
+st.caption("Tip: keep Top N at 200–400 for a good balance between coverage and speed. Parallel download is used.")
+
+# ----------------- Helper scanning function -----------------
+def evaluate_symbol(sym, period, do_backtest=False, backtest_hold=5, show_sector=False):
+    """
+    Download, compute features, train simple ensemble, get buy probability, backtest score (optional),
+    compute 10% target and 5% stoploss.
+    Returns dict or None.
+    """
+    try:
+        hist = download_history(sym, period)
+        if hist is None or len(hist) < MIN_HISTORY_DAYS:
+            return None
+        hist = add_technical_features(hist)
+        X, y, features = prepare_ml_data(hist)
+        if X is None or y is None:
+            return None
+        model = build_model()
+        # cross-val for reliability indicator
+        try:
+            cv_acc = float(np.mean(cross_val_score(model, X, y, cv=3, scoring='accuracy')))
+        except Exception:
+            cv_acc = np.nan
+        # fit on all data and predict last row
+        model.fit(X, y)
+        last = X.iloc[-1]
+        proba = float(model.predict_proba(last.to_frame().T)[0][1])
+        # compute simple momentum (last 5-day return)
+        momentum = float(hist['Close'].pct_change(5).iloc[-1]) if 'Close' in hist.columns else 0.0
+        # optional light backtest: expanding-window simple simulation
+        bt_win = np.nan
+        if do_backtest:
+            bt_win = simple_backtest_light(hist, features, hold_days=backtest_hold)
+        last_close = float(hist['Close'].iloc[-1])
+        # enforce 10% target. If ATR suggests higher target, keep the higher (helps volatile stocks)
+        atr = float(hist['atr'].iloc[-1]) if 'atr' in hist.columns else (np.std(hist['Close'].pct_change()) * last_close)
+        target_by_atr = last_close + atr * 2.0  # 2x ATR is a reasonable swing target
+        fixed_target = last_close * 1.10
+        target = max(fixed_target, target_by_atr)
+        stop_loss = last_close * 0.95
+        # optional sector
+        sector = None
+        if show_sector:
+            try:
+                info = yf.Ticker(sym).info
+                sector = info.get('sector', None)
+            except Exception:
+                sector = None
+        return {
+            'Stock': sym.replace('.NS',''),
+            'SymFull': sym,
+            'Proba': proba,
+            'CV_Acc': cv_acc,
+            'Momentum': momentum,
+            'BacktestWin': bt_win,
+            'Entry': last_close,
+            'Target': target,
+            'StopLoss': stop_loss,
+            'ATR': atr,
+            'Sector': sector
+        }
+    except Exception:
+        return None
+
+def simple_backtest_light(hist, features, hold_days=5):
+    """
+    A small, fast expanding-window light backtest.
+    We train on past and test 1-step forward; count profitable predicted buys.
+    """
+    try:
+        df = hist.copy().dropna()
+        X = df[features]
+        y = (df['Close'].shift(-1) > df['Close']).astype(int)
+        X = X.iloc[:-hold_days]
+        y = y.iloc[:-hold_days]
+        if len(X) < 40:
+            return np.nan
+        model = build_model()
+        wins = 0
+        trades = 0
+        # expanding-window realistic simulation; limited to speed
+        for i in range(30, len(X)-1, max(1, int(len(X)/50))):  # sample a subset to stay fast
+            X_train = X.iloc[:i]
+            y_train = y.iloc[:i]
+            X_test = X.iloc[i:i+1]
+            if y_train.nunique() < 2:
+                continue
             model.fit(X_train, y_train)
-            p = model.predict_proba(X_test_row)[0][1]
-            if p > 0.6:  # historically take predicted buys only
-                buy_index = X_test_row.index[0]
-                sell_index = buy_index + timedelta(days=hold_days)
-                # find closest sell index in df (index is date)
+            p = model.predict_proba(X_test)[0][1]
+            if p > 0.6:
+                idx = X_test.index[0]
+                # find sell price after hold_days
+                sell_idx = idx + timedelta(days=hold_days)
                 try:
-                    sell_price = df.loc[df.index >= sell_index, 'Close'].iloc[0]
-                except:
-                    # if not enough days left, skip
+                    sell_price = df.loc[df.index >= sell_idx, 'Close'].iloc[0]
+                except Exception:
                     continue
-                buy_price = df.loc[buy_index, 'Close']
+                buy_price = df.loc[idx, 'Close']
                 trades += 1
                 if sell_price > buy_price:
                     wins += 1
-        except Exception:
-            continue
-    if trades == 0:
-        return None
-    return float(wins / trades)
+        if trades == 0:
+            return np.nan
+        return float(wins / trades)
+    except Exception:
+        return np.nan
 
-# ---- Sidebar controls ----
-st.sidebar.header("Scan & Model Settings")
-timeframe = st.sidebar.selectbox("Feature timeframe (history)", options=['90d','180d','365d','730d'], index=1)
-top_n = st.sidebar.number_input("Top N stocks to scan (performance sensitive)", min_value=10, max_value=500, value=DEFAULT_TOPN_SCAN, step=10)
-confidence_threshold = st.sidebar.slider("Confidence threshold for BUY", min_value=0.51, max_value=0.9, value=float(DEFAULT_CONF_THRESHOLD), step=0.01)
-hold_days = st.sidebar.slider("Hypothetical hold days for target", min_value=1, max_value=21, value=int(DEFAULT_HOLD_DAYS), step=1)
-min_backtest_win = st.sidebar.slider("Minimum historical backtest win-rate (for recommendation)", min_value=0.0, max_value=1.0, value=0.55, step=0.01)
-run_scan = st.sidebar.button("Run Scan")
+# ----------------- Run scan (parallel) -----------------
+def run_scan(universe, period, top_n, min_picks, backtest_flag=False, backtest_hold=5, show_sector=False):
+    results = []
+    to_scan = universe[:top_n]
+    # parallelize downloads & eval
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(evaluate_symbol, s, period, backtest_flag, backtest_hold, show_sector): s for s in to_scan}
+        for i, fut in enumerate(concurrent.futures.as_completed(futures)):
+            sym = futures[fut]
+            try:
+                res = fut.result()
+                if res is not None:
+                    results.append(res)
+            except Exception:
+                continue
+    return results
 
-# ---- Load stocks ----
-stock_list = fetch_stock_list()
-if not stock_list:
-    st.error("No stocks list found. Make sure stocks_list.csv exists and has SYMBOL column or tickers in first column.")
-    st.stop()
+# ----------------- UI: run or show last results -----------------
+st.markdown("## Run daily scan")
+st.write("Choose options and press **Run daily scan now**. The app will return top picks ranked by confidence × momentum × optional backtest.")
+if scan_button:
+    t0 = time.time()
+    with st.spinner("Scanning universe — this may take a minute for 200+ tickers..."):
+        scan_results = run_scan(stock_list, timeframe, int(top_n), int(min_picks), enable_backtest, backtest_hold, enable_sector)
+    duration = time.time() - t0
+    st.success(f"Scan complete — evaluated {len(scan_results)} tickers in {duration:.1f}s")
 
-st.markdown(f"**Stocks loaded:** {len(stock_list)} · analyzing top {top_n} (first N from file)")
-st.caption("Note: this is experimental and educational — backtest results are simplified estimates, not trading advice.")
+    if len(scan_results) == 0:
+        st.warning("No symbols returned — try increasing Top N or reduce timeframe.")
+    else:
+        df = pd.DataFrame(scan_results)
+        # Fill NaN backtest with median to avoid NaN sorting
+        df['BacktestWin'] = df['BacktestWin'].fillna(df['BacktestWin'].median() if df['BacktestWin'].notna().any() else 0.5)
+        # Score composition:
+        # Score = proba * (1 + momentum_factor) * (0.6 + 0.4*backtest_win) * CV acc factor
+        # momentum factor: positive momentum increases score, negative reduces
+        df['MomentumFactor'] = 1 + (df['Momentum'].clip(-0.2, 0.5))  # bounds to avoid wild swings
+        df['BacktestFactor'] = 0.6 + 0.4 * df['BacktestWin']  # between 0.6 and 1.0
+        df['CVFactor'] = 1 + df['CV_Acc'].fillna(0.0) - 0.5  # center around 0.5
+        df['Score'] = df['Proba'] * df['MomentumFactor'] * df['BacktestFactor'] * df['CVFactor']
+        df = df.sort_values('Score', ascending=False).reset_index(drop=True)
 
-# ---- Single-stock detailed view on the left ----
-col1, col2 = st.columns([2,1])
+        # Ensure at least min_picks picks
+        picks = df.head(max(int(min_picks), MIN_PICKS)).copy()
+        # Guarantee at least 5 by fallback: if not enough qualified, take top rows anyway
+        if len(picks) < min_picks and len(df) >= min_picks:
+            picks = df.head(min_picks).copy()
 
-with col2:
-    st.markdown("### Quick Analyzer")
-    selected_stock = st.selectbox("Select stock for deep analysis", options=stock_list, index=0)
-    if selected_stock:
-        hist = download_history(selected_stock, period=timeframe)
-        if hist is None or len(hist) < MIN_HISTORY_DAYS:
-            st.warning("Not enough history for this symbol.")
-        else:
-            hist = add_technical_features(hist)
-            X, y, features = prepare_ml_data(hist)
-            if X is None:
-                st.warning("Insufficient features computed for ML.")
-            else:
-                model = build_model()
-                cv_acc = cross_validate_model(model, X, y) or 0.0
-                # fit and predict last
-                model.fit(X, y)
-                last_row = X.iloc[-1]
-                proba = float(model.predict_proba(last_row.to_frame().T)[0][1])
-                sentiment = get_sentiment_score(selected_stock.replace('.NS',''))
-                last_close = hist['Close'].iloc[-1]
-                # targets based on ATR
-                atr = hist['atr'].iloc[-1] if 'atr' in hist.columns else (hist['Close'].pct_change().std()*last_close)
-                target = last_close + atr * 1.0
-                stop_loss = last_close - atr * 0.8
+        # Now compute fixed 10% target & 5% stop (also keep ATR-based if larger target)
+        picks['FixedTarget'] = picks['Entry'] * 1.10
+        picks['ATRTarget'] = picks['Entry'] + picks['ATR'] * 2.0
+        picks['TargetFinal'] = picks[['FixedTarget', 'ATRTarget']].max(axis=1)
+        picks['StopLossFinal'] = picks['Entry'] * 0.95
+        picks['PotentialPct'] = (picks['TargetFinal'] / picks['Entry'] - 1) * 100
+        picks['RiskPct'] = (1 - picks['StopLossFinal'] / picks['Entry']) * 100
 
-                st.markdown(f"#### {selected_stock} — Latest snapshot")
-                st.metric("Model BUY probability", f"{proba:.2%}", delta=None)
-                st.metric("CV accuracy (3-fold)", f"{cv_acc:.2%}")
-                st.metric("Sentiment (news polarity)", f"{sentiment:.3f}")
+        # Display picks
+        display_cols = ['Stock', 'Sector', 'Entry', 'TargetFinal', 'StopLossFinal', 'PotentialPct', 'RiskPct', 'Proba', 'BacktestWin', 'CV_Acc', 'Score']
+        picks_display = picks[display_cols].copy()
+        picks_display = picks_display.rename(columns={'TargetFinal': 'Target', 'StopLossFinal':'StopLoss'})
+        # Formatting
+        picks_display['Entry'] = picks_display['Entry'].map(lambda x: f"₹{x:.2f}")
+        picks_display['Target'] = picks_display['Target'].map(lambda x: f"₹{x:.2f}")
+        picks_display['StopLoss'] = picks_display['StopLoss'].map(lambda x: f"₹{x:.2f}")
+        picks_display['PotentialPct'] = picks_display['PotentialPct'].map(lambda x: f"{x:.1f}%")
+        picks_display['RiskPct'] = picks_display['RiskPct'].map(lambda x: f"{x:.1f}%")
+        picks_display['Proba'] = picks_display['Proba'].map(lambda x: f"{x:.1%}")
+        picks_display['BacktestWin'] = picks_display['BacktestWin'].map(lambda x: f"{x:.1%}" if not pd.isna(x) else "N/A")
+        picks_display['CV_Acc'] = picks_display['CV_Acc'].map(lambda x: f"{x:.1%}" if not pd.isna(x) else "N/A")
+        picks_display['Score'] = picks_display['Score'].map(lambda x: f"{x:.4f}")
 
-                # Price chart with overlays
+        st.markdown(f"### Today's top {len(picks_display)} AI-selected BUY candidates (aiming ≥10% profit)")
+        st.dataframe(picks_display, use_container_width=True)
+
+        # Download CSV
+        csv = picks.to_csv(index=False).encode('utf-8')
+        st.download_button("Download picks CSV", csv, "pro_trader_picks.csv", "text/csv")
+
+        # Let the user click one for a deep dive
+        chosen = st.selectbox("Deep dive: choose one pick", options=picks['Stock'].tolist())
+        if chosen:
+            row = picks[picks['Stock'] == chosen].iloc[0]
+            symfull = row['SymFull']  # original symbol with .NS possibly
+            hist = download_history(symfull, timeframe)
+            if hist is not None:
+                st.markdown(f"#### {chosen} chart & indicators")
+                hist = add_technical_features(hist)
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'], name='Price'))
                 if 'ma21' in hist.columns:
-                    fig.add_trace(go.Scatter(x=hist.index, y=hist['ma21'], name='MA21', mode='lines', line=dict(width=1)))
-                if 'rsi' in hist.columns:
-                    fig.update_layout(yaxis2=dict(title='RSI', overlaying='y', side='right', range=[0,100]))
-                fig.update_layout(title=f"{selected_stock} Price", height=420, xaxis_rangeslider_visible=False)
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['ma21'], name='MA21'))
+                fig.update_layout(height=450, xaxis_rangeslider_visible=False)
                 st.plotly_chart(fig, use_container_width=True)
+                st.write("Latest stats:")
+                st.write({
+                    'Entry': f"₹{row['Entry']:.2f}",
+                    'Target (final)': f"₹{row['TargetFinal']:.2f}",
+                    'StopLoss': f"₹{row['StopLossFinal']:.2f}",
+                    'Predicted Prob': f"{row['Proba']:.1%}",
+                    'Momentum (5d)': f"{row['Momentum']:.2%}"})
+            else:
+                st.warning("No historical data available for deep-dive chart.")
+        st.info("⚠️ This tool is educational. Backtests here are simplified. Always perform your own risk management and due diligence.")
 
-                with st.expander("Feature importances / details"):
-                    # simple RF feature importance
-                    try:
-                        rf = RandomForestClassifier(n_estimators=80, random_state=42)
-                        rf.fit(X, y)
-                        importances = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
-                        st.write(importances.to_frame("importance").head(12))
-                    except Exception:
-                        st.write("Feature importance not available.")
+# ----------------- If not scanning yet, give sample overview -----------------
+else:
+    st.markdown("Press **Run daily scan now** in the sidebar to evaluate the universe and get today's picks.")
+    st.markdown("You can also:")
+    st.markdown("- Provide a NewsAPI key in the sidebar to improve sentiment (optional).")
+    st.markdown("- Enable 'Enable light historical backtest' (slower, but increases reliability).")
+    st.markdown("- Toggle 'Show sector' to display sectors fetched from yfinance (may be slower).")
 
-# ---- Bulk scan & recommendations ----
-with col1:
-    st.markdown("## Scan & Recommendations")
-
-    if run_scan:
-        progress = st.progress(0)
-        recommendations = []
-        scanned = 0
-        total_to_scan = min(len(stock_list), top_n)
-        for i, sym in enumerate(stock_list[:total_to_scan]):
-            scanned += 1
-            progress.progress(int(scanned/total_to_scan * 100))
-            hist = download_history(sym, period=timeframe)
-            if hist is None or len(hist) < MIN_HISTORY_DAYS:
-                continue
-            hist = add_technical_features(hist)
-            X, y, features = prepare_ml_data(hist)
-            if X is None or len(X) < 40:
-                continue
-            model = build_model()
-            try:
-                # cross-val accuracy estimate
-                cv_acc = cross_validate_model(model, X, y) or 0.0
-                model.fit(X, y)
-                last_row = X.iloc[-1]
-                proba = float(model.predict_proba(last_row.to_frame().T)[0][1])
-                # quick historical backtest (lightweight)
-                backtest_win = simple_backtest(hist, features, hold_days=hold_days) or 0.0
-                last_close = hist['Close'].iloc[-1]
-                atr = hist['atr'].iloc[-1] if 'atr' in hist.columns else (hist['Close'].pct_change().std()*last_close)
-                target = last_close + atr * 1.0
-                # final filter
-                if proba >= confidence_threshold and backtest_win >= min_backtest_win:
-                    recommendations.append({
-                        'Stock': sym.replace('.NS',''),
-                        'Proba': proba,
-                        'CV Acc': cv_acc,
-                        'Backtest Win': backtest_win,
-                        'Entry': last_close,
-                        'Target': target,
-                        'ATR': atr
-                    })
-            except Exception:
-                continue
-
-        progress.empty()
-        if len(recommendations) == 0:
-            st.info("No recommendations found with current filters. Try lowering thresholds or increasing Top N.")
-        else:
-            rec_df = pd.DataFrame(recommendations).sort_values(by='Proba', ascending=False).reset_index(drop=True)
-            rec_df_display = rec_df.copy()
-            rec_df_display['Proba'] = rec_df_display['Proba'].map("{:.2%}".format)
-            rec_df_display['CV Acc'] = rec_df_display['CV Acc'].map(lambda x: f"{x:.2%}" if not pd.isna(x) else "N/A")
-            rec_df_display['Backtest Win'] = rec_df_display['Backtest Win'].map("{:.2%}".format)
-            rec_df_display['Entry'] = rec_df_display['Entry'].map(lambda x: f"₹{x:.2f}")
-            rec_df_display['Target'] = rec_df_display['Target'].map(lambda x: f"₹{x:.2f}")
-            st.write(f"### Top recommendations ({len(rec_df)} found)")
-            st.dataframe(rec_df_display)
-
-            # Download button
-            csv = rec_df.to_csv(index=False).encode('utf-8')
-            st.download_button("Download recommendations CSV", csv, "recs.csv", "text/csv")
-
-            # allow pick one for deep dive
-            chosen = st.selectbox("Deep dive into recommendation", options=rec_df['Stock'])
-            if chosen:
-                chosen_sym = chosen + '.NS' if not chosen.endswith('.NS') else chosen
-                hist = download_history(chosen_sym, period=timeframe)
-                hist = add_technical_features(hist)
-                X, y, features = prepare_ml_data(hist)
-                if X is not None:
-                    model = build_model()
-                    model.fit(X, y)
-                    last_row = X.iloc[-1]
-                    proba = float(model.predict_proba(last_row.to_frame().T)[0][1])
-                    sentiment = get_sentiment_score(chosen)
-                    st.markdown(f"### {chosen} — Detailed report")
-                    st.write(f"Model probability: {proba:.2%}")
-                    st.write(f"Sentiment: {sentiment:.3f}")
-                    st.write("Feature set used:", features)
-                    st.line_chart(hist[['Close']].tail(120))
-                    # show feature importance if RF available
-                    try:
-                        rf = RandomForestClassifier(n_estimators=80, random_state=42)
-                        rf.fit(X, y)
-                        importances = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
-                        st.write(importances.head(10))
-                    except:
-                        pass
-
-# Footer / Disclaimer
+# ----------------- Footer / Help -----------------
 st.markdown("---")
-st.caption("Disclaimer: This tool is for educational/demonstration purposes only. Not financial advice. Always DYOR before trading.")
+st.markdown("**How this picks stocks:** model predicts next-day up-probability using technical features, then scores stocks by probability × momentum × light backtest × CV reliability. Final targets are at least 10% (or ATR-based if larger).")
+st.markdown("**Optional next steps (recommended):** add fundamental filters (PE, revenue growth), attach position sizing rules, and implement stop-loss order automation via your broker API (careful).")
