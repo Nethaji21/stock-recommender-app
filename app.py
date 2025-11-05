@@ -1,4 +1,4 @@
-# app.py — Pro Trader Picks (fixed version)
+# app.py — Pro Trader Picks (final stable version)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -13,8 +13,6 @@ from datetime import timedelta
 import ta
 import concurrent.futures
 import time
-import feedparser
-from textblob import TextBlob
 
 # ----------------- Streamlit Page Config -----------------
 st.set_page_config(page_title="Pro Trader Picks — Daily Top 5", layout="wide")
@@ -133,14 +131,21 @@ def evaluate_symbol(sym, period):
         return None
     hist = add_technical_features(hist)
     X, y, feats = prepare_ml_data(hist)
-    if X is None:
+    if X is None or y is None:
         return None
+
+    # 🛠 Fix: skip if only one target class
+    if y.nunique() < 2:
+        print(f"⚠️ Skipped {sym}: target has only one class ({y.unique()})")
+        return None
+
     model = build_model()
     try:
         cv = cross_val_score(model, X, y, cv=3, scoring="accuracy")
         cv_acc = float(np.mean(cv))
     except Exception:
         cv_acc = np.nan
+
     model.fit(X, y)
     proba = float(model.predict_proba(X.iloc[-1:].to_numpy())[0][1])
     last_close = hist["Close"].iloc[-1]
