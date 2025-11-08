@@ -1,4 +1,4 @@
-# app.py — Pro Trader Picks (final stable version)
+# app.py — Pro Trader Picks (Full-Universe 120d Version)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,13 +9,14 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import cross_val_score
-from datetime import timedelta
 import ta
 import concurrent.futures
 import time
+import os, json, traceback
+from pathlib import Path
 
 # ----------------- Streamlit Page Config -----------------
-st.set_page_config(page_title="Pro Trader Picks — Daily Top 5", layout="wide")
+st.set_page_config(page_title="Pro Trader Picks — Full Universe", layout="wide")
 
 # ----------------- Styling -----------------
 st.markdown(
@@ -24,40 +25,38 @@ st.markdown(
     .header {background: linear-gradient(90deg,#0b1220,#081827); padding:18px; border-radius:10px;}
     .title {font-size:28px; color:#a8e3ff; font-weight:700;}
     .sub {color:#cfefff; opacity:0.9;}
-    .card {background:#06111a; padding:12px; border-radius:8px; border:1px solid rgba(255,255,255,0.03);}
     </style>
     """,
     unsafe_allow_html=True
 )
 
 st.markdown(
-    '<div class="header"><div class="title">Pro Trader Picks</div>'
-    '<div class="sub">Daily Top 5 BUY Recommendations — Ensemble ML Model (Educational Use Only)</div></div>',
+    '<div class="header"><div class="title">Pro Trader Picks — Full Universe</div>'
+    '<div class="sub">Scans all stocks (~12k) over 120 days for top 5 BUY setups (Educational Use Only)</div></div>',
     unsafe_allow_html=True
 )
 
 # ----------------- Constants -----------------
-MIN_HISTORY_DAYS = 120
-DEFAULT_TIMEFRAME = "365d"
-DEFAULT_TOPN = 200
+MIN_HISTORY_DAYS = 60
+PERIOD = "120d"           # Fixed timeframe
+BATCH_SIZE = 200          # tickers per batch
+SLEEP_BETWEEN = 1.0       # seconds between batches
 MIN_PICKS = 5
-DEFAULT_TTL = 3600  # cache 1h
+CACHE_DIR = Path("yf_cache")
+CACHE_DIR.mkdir(exist_ok=True)
 
-# ----------------- Utilities -----------------
-@st.cache_data(ttl=DEFAULT_TTL)
+# ----------------- Utility functions -----------------
+@st.cache_data(ttl=3600)
 def load_stock_list(path="stocks_list.csv"):
-    """Loads ticker list and ensures .NS suffix for NSE stocks."""
     try:
         df = pd.read_csv(path)
         if "SYMBOL" in df.columns:
             syms = df["SYMBOL"].astype(str).tolist()
         else:
             syms = df.iloc[:, 0].astype(str).tolist()
-        # auto-append .NS if missing
         syms = [
             s.strip() + ".NS" if not s.strip().endswith(".NS") else s.strip()
-            for s in syms
-            if s.strip() != ""
+            for s in syms if s.strip() != ""
         ]
         print(f"✅ Loaded {len(syms)} tickers")
         return syms
@@ -65,22 +64,27 @@ def load_stock_list(path="stocks_list.csv"):
         print("❌ Error loading stock list:", e)
         return []
 
+def chunk_list(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
-@st.cache_data(ttl=DEFAULT_TTL)
-def download_history(symbol, period):
+def cache_save(symbol, payload):
     try:
-        data = yf.Ticker(symbol).history(period=period, interval="1d")
-        if data is None or data.empty:
-            print(f"⚠️ Empty data for {symbol}")
-            return None
-        return data.dropna()
-    except Exception as e:
-        print(f"❌ Error downloading {symbol}: {e}")
-        return None
+        with open(CACHE_DIR / f"{symbol}.json", "w") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
 
+def cache_load(symbol):
+    p = CACHE_DIR / f"{symbol}.json"
+    if p.exists():
+        try:
+            return json.load(open(p))
+        except Exception:
+            return None
+    return None
 
 def add_technical_features(df):
-    """Add technical indicators using TA-lib"""
     df = df.copy()
     df["ret1"] = df["Close"].pct_change(1)
     df["ret5"] = df["Close"].pct_change(5)
@@ -92,16 +96,12 @@ def add_technical_features(df):
         df["rsi"] = ta.momentum.RSIIndicator(df["Close"]).rsi()
         macd = ta.trend.MACD(df["Close"])
         df["macd_diff"] = macd.macd_diff()
-        bb = ta.volatility.BollingerBands(df["Close"])
-        df["bb_h"] = bb.bollinger_hband()
-        df["bb_l"] = bb.bollinger_lband()
         df["atr"] = ta.volatility.AverageTrueRange(
             df["High"], df["Low"], df["Close"]
         ).average_true_range()
     except Exception:
         pass
     return df.dropna()
-
 
 def prepare_ml_data(hist):
     df = hist.copy()
@@ -114,86 +114,103 @@ def prepare_ml_data(hist):
     y = df["target"].iloc[:-1]
     return X, y, avail
 
-
 def build_model():
-    rf = Pipeline(
-        [("scaler", StandardScaler()), ("rf", RandomForestClassifier(n_estimators=120, random_state=42))]
-    )
-    lr = Pipeline(
-        [("scaler", StandardScaler()), ("lr", LogisticRegression(max_iter=400, random_state=42))]
-    )
+    rf = Pipeline([("scaler", StandardScaler()), ("rf", RandomForestClassifier(n_estimators=120, random_state=42))])
+    lr = Pipeline([("scaler", StandardScaler()), ("lr", LogisticRegression(max_iter=400, random_state=42))])
     return VotingClassifier(estimators=[("rf", rf), ("lr", lr)], voting="soft")
 
-
-def evaluate_symbol(sym, period):
-    hist = download_history(sym, period)
-    if hist is None or len(hist) < MIN_HISTORY_DAYS:
-        return None
-    hist = add_technical_features(hist)
-    X, y, feats = prepare_ml_data(hist)
-    if X is None or y is None:
-        return None
-
-    # 🛠 Fix: skip if only one target class
-    if y.nunique() < 2:
-        print(f"⚠️ Skipped {sym}: target has only one class ({y.unique()})")
-        return None
-
-    model = build_model()
-    try:
-        cv = cross_val_score(model, X, y, cv=3, scoring="accuracy")
-        cv_acc = float(np.mean(cv))
-    except Exception:
-        cv_acc = np.nan
-
-    model.fit(X, y)
-    proba = float(model.predict_proba(X.iloc[-1:].to_numpy())[0][1])
-    last_close = hist["Close"].iloc[-1]
-    atr = hist["atr"].iloc[-1] if "atr" in hist.columns else last_close * 0.03
-    target = max(last_close * 1.10, last_close + atr * 2)
-    stop = last_close * 0.95
-    print(f"✅ Scanned {sym}: proba={proba:.2f}")
-    return {
-        "Stock": sym.replace(".NS", ""),
-        "Proba": proba,
-        "CV": cv_acc,
-        "Entry": last_close,
-        "Target": target,
-        "Stop": stop,
-        "ATR": atr,
-    }
-
-
-def run_scan(universe, period, topn=100):
-    to_scan = universe[:topn]
+# ----------------- Main scanning logic -----------------
+def run_scan_all(universe, period=PERIOD, batch_size=BATCH_SIZE, sleep_between_batches=SLEEP_BETWEEN):
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        futs = [ex.submit(evaluate_symbol, s, period) for s in to_scan]
-        for f in concurrent.futures.as_completed(futs):
-            res = f.result()
-            if res:
-                results.append(res)
+    total = len(universe)
+    processed = 0
+
+    for batch_idx, batch in enumerate(chunk_list(universe, batch_size), start=1):
+        try:
+            raw = yf.download(tickers=batch, period=period, interval="1d", group_by="ticker", threads=True, progress=False)
+        except Exception as e:
+            print(f"⚠️ Batch {batch_idx} failed: {e}")
+            raw = None
+
+        for sym in batch:
+            try:
+                cached = cache_load(sym.replace(".NS", ""))
+                if cached:
+                    results.append(cached)
+                    processed += 1
+                    continue
+
+                df = None
+                if raw is not None and isinstance(raw.columns, pd.MultiIndex):
+                    if sym in raw.columns.get_level_values(0):
+                        df = raw[sym].dropna(how="all")
+                        if df.empty:
+                            df = None
+                if df is None or len(df) < MIN_HISTORY_DAYS:
+                    try:
+                        df = yf.Ticker(sym).history(period=period, interval="1d")
+                        if df is None or df.empty:
+                            df = None
+                    except Exception:
+                        df = None
+                if df is None or len(df) < MIN_HISTORY_DAYS:
+                    processed += 1
+                    continue
+
+                hist = add_technical_features(df)
+                X, y, feats = prepare_ml_data(hist)
+                if X is None or y is None or y.nunique() < 2:
+                    processed += 1
+                    continue
+
+                model = build_model()
+                try:
+                    cv = cross_val_score(model, X, y, cv=3, scoring="accuracy")
+                    cv_acc = float(np.mean(cv))
+                except Exception:
+                    cv_acc = np.nan
+
+                model.fit(X, y)
+                proba = float(model.predict_proba(X.iloc[-1:].to_numpy())[0][1])
+                last_close = hist["Close"].iloc[-1]
+                atr = hist["atr"].iloc[-1] if "atr" in hist.columns else last_close * 0.03
+                target = max(last_close * 1.10, last_close + atr * 2)
+                stop = last_close * 0.95
+
+                rec = {
+                    "Stock": sym.replace(".NS", ""),
+                    "Proba": proba,
+                    "CV": cv_acc,
+                    "Entry": last_close,
+                    "Target": target,
+                    "Stop": stop,
+                    "ATR": atr,
+                }
+                results.append(rec)
+                cache_save(sym.replace(".NS", ""), rec)
+            except Exception as e:
+                print(f"Error processing {sym}: {e}\n{traceback.format_exc()}")
+            finally:
+                processed += 1
+        print(f"Batch {batch_idx} done: {processed}/{total}")
+        time.sleep(sleep_between_batches)
+
     return results
 
-
-# ----------------- Sidebar Controls -----------------
-st.sidebar.header("Settings")
-timeframe = st.sidebar.selectbox("History timeframe", ["180d", "365d", "730d"], index=1)
-topn = st.sidebar.slider("Top N stocks to scan", 10, 500, 100, 10)
-run_btn = st.sidebar.button("Run Daily Scan")
-
-# ----------------- Main Logic -----------------
+# ----------------- App UI -----------------
 stock_list = load_stock_list()
 if not stock_list:
-    st.error("No valid tickers found. Please upload a stocks_list.csv with tickers like 'TCS.NS'.")
+    st.error("No valid tickers found in stocks_list.csv. Ensure tickers like 'TCS.NS'.")
     st.stop()
 
-if run_btn:
-    st.info("Scanning stocks... please wait 1–2 minutes.")
+if st.button("Run Full Universe Scan (120 days)"):
+    st.info("Scanning all tickers… please wait. This may take a long time for 12k stocks.")
     t0 = time.time()
-    data = run_scan(stock_list, timeframe, topn)
+    data = run_scan_all(stock_list)
+    duration = time.time() - t0
+
     if len(data) == 0:
-        st.error("No recommendations found. Verify your ticker list or internet connectivity.")
+        st.error("No valid recommendations found.")
         st.stop()
 
     df = pd.DataFrame(data)
@@ -201,49 +218,38 @@ if run_btn:
     df = df.sort_values("Score", ascending=False).reset_index(drop=True)
     picks = df.head(max(MIN_PICKS, 5))
 
-    # Format
     picks["Potential %"] = (picks["Target"] / picks["Entry"] - 1) * 100
     picks["Risk %"] = (1 - picks["Stop"] / picks["Entry"]) * 100
-    picks_display = picks.copy()
-    picks_display["Entry"] = picks_display["Entry"].map(lambda x: f"₹{x:.2f}")
-    picks_display["Target"] = picks_display["Target"].map(lambda x: f"₹{x:.2f}")
-    picks_display["Stop"] = picks_display["Stop"].map(lambda x: f"₹{x:.2f}")
-    picks_display["Proba"] = picks_display["Proba"].map("{:.1%}".format)
-    picks_display["CV"] = picks_display["CV"].map("{:.1%}".format)
-    picks_display["Potential %"] = picks_display["Potential %"].map("{:.1f}%".format)
-    picks_display["Risk %"] = picks_display["Risk %"].map("{:.1f}%".format)
 
-    st.success(f"✅ Found {len(picks_display)} top BUY recommendations!")
-    st.dataframe(picks_display, use_container_width=True)
+    for col in ["Entry", "Target", "Stop"]:
+        picks[col] = picks[col].map(lambda x: f"₹{x:.2f}")
+    picks["Proba"] = picks["Proba"].map("{:.1%}".format)
+    picks["CV"] = picks["CV"].map("{:.1%}".format)
+    picks["Potential %"] = picks["Potential %"].map("{:.1f}%".format)
+    picks["Risk %"] = picks["Risk %"].map("{:.1f}%".format)
+
+    st.success(f"✅ Scan finished in {duration/60:.1f} minutes — showing top {len(picks)} BUY setups.")
+    st.dataframe(picks, use_container_width=True)
 
     csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download all recommendations (CSV)", csv, "recommendations.csv", "text/csv")
+    st.download_button("Download all results (CSV)", csv, "recommendations.csv", "text/csv")
 
-    choice = st.selectbox("Deep dive chart", picks["Stock"])
-    if choice:
-        sym = choice + ".NS"
-        hist = download_history(sym, timeframe)
-        if hist is not None:
+    sym = st.selectbox("View chart for", picks["Stock"])
+    if sym:
+        hist = yf.Ticker(sym + ".NS").history(period=PERIOD)
+        if not hist.empty:
             fig = go.Figure()
-            fig.add_trace(
-                go.Candlestick(
-                    x=hist.index,
-                    open=hist["Open"],
-                    high=hist["High"],
-                    low=hist["Low"],
-                    close=hist["Close"],
-                    name="Price",
-                )
-            )
-            if "ma21" in hist.columns:
-                hist["ma21"] = hist["Close"].rolling(21).mean()
-                fig.add_trace(go.Scatter(x=hist.index, y=hist["ma21"], name="MA21"))
+            fig.add_trace(go.Candlestick(
+                x=hist.index,
+                open=hist["Open"], high=hist["High"],
+                low=hist["Low"], close=hist["Close"], name="Price"
+            ))
+            hist["ma21"] = hist["Close"].rolling(21).mean()
+            fig.add_trace(go.Scatter(x=hist.index, y=hist["ma21"], name="MA21"))
             fig.update_layout(height=450, xaxis_rangeslider_visible=False)
             st.plotly_chart(fig, use_container_width=True)
-
 else:
-    st.markdown("### 👈 Click **Run Daily Scan** to get today's top 5 BUY recommendations.")
-    st.markdown("Ensure your `stocks_list.csv` file is uploaded and has NSE tickers (e.g., `TCS.NS`).")
+    st.markdown("### 👈 Press **Run Full Universe Scan (120 days)** to get today's top 5 BUY recommendations.")
 
 st.markdown("---")
 st.caption("⚠️ For education only. No financial advice.")
