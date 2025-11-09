@@ -1,18 +1,9 @@
-"""
-scan_all.py — Automated daily stock scanner
--------------------------------------------
-Runs a simplified ML-based scan for top stock picks and saves
-results as daily_recommendations.csv.
-
-Designed for GitHub Actions or offline batch runs.
-"""
-
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import ta
-import time, json, random, traceback
+import ta, time, json, random, traceback
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -20,36 +11,27 @@ from sklearn.pipeline import Pipeline
 from sklearn.model_selection import cross_val_score
 from yfinance.exceptions import YFRateLimitError
 
-# ================= CONFIG ==================
-PERIOD = "120d"          # how many days of data to fetch
-MIN_HISTORY = 60         # skip if fewer rows
-BATCH_SIZE = 100         # how many symbols before a short pause
-SLEEP_BETWEEN_BATCHES = 1.5
+PERIOD = "120d"
+MIN_HISTORY = 60
 CACHE_DIR = Path("yf_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 OUTPUT_FILE = Path("daily_recommendations.csv")
+THREADS = 8
 
-# ===========================================
-
-def safe_download(sym, period=PERIOD, tries=4, sleep_base=5):
-    """Download with retry and backoff."""
+def safe_download(sym, tries=4, sleep_base=5):
     for attempt in range(tries):
         try:
-            df = yf.Ticker(sym).history(period=period, interval="1d")
+            df = yf.Ticker(sym).history(period=PERIOD, interval="1d")
             if not df.empty:
                 return df
         except YFRateLimitError:
-            wait = sleep_base * (attempt + 1) + random.uniform(0, 3)
-            print(f"[RateLimit] {sym}: sleeping {wait:.1f}s...")
+            wait = sleep_base * (attempt + 1) + random.uniform(0, 2)
             time.sleep(wait)
-        except Exception as e:
-            print(f"[Error] {sym}: {e}")
-            break
+        except Exception:
+            pass
     return None
 
-
 def add_features(df):
-    """Add technical indicators used in the ML model."""
     df = df.copy()
     df["ret1"] = df["Close"].pct_change(1)
     df["ret5"] = df["Close"].pct_change(5)
@@ -68,27 +50,23 @@ def add_features(df):
         pass
     return df.dropna()
 
-
 def prepare_data(df):
-    """Prepare ML inputs."""
     df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
-    feats = ["rsi", "macd_diff", "vol_spike", "atr", "ret1", "ret5", "ma7", "ma21"]
+    feats = ["rsi","macd_diff","vol_spike","atr","ret1","ret5","ma7","ma21"]
     X = df[feats].iloc[:-1].fillna(0)
     y = df["target"].iloc[:-1]
     return X, y
 
-
 def build_model():
     rf = Pipeline([
         ("scaler", StandardScaler()),
-        ("rf", RandomForestClassifier(n_estimators=120, random_state=42))
+        ("rf", RandomForestClassifier(n_estimators=80, random_state=42))
     ])
     lr = Pipeline([
         ("scaler", StandardScaler()),
-        ("lr", LogisticRegression(max_iter=400, random_state=42))
+        ("lr", LogisticRegression(max_iter=300, random_state=42))
     ])
     return VotingClassifier(estimators=[("rf", rf), ("lr", lr)], voting="soft")
-
 
 def evaluate_symbol(sym):
     cache_file = CACHE_DIR / f"{sym.replace('.NS','')}.json"
@@ -97,7 +75,6 @@ def evaluate_symbol(sym):
             return json.load(open(cache_file))
         except Exception:
             pass
-
     df = safe_download(sym)
     if df is None or len(df) < MIN_HISTORY:
         return None
@@ -107,7 +84,6 @@ def evaluate_symbol(sym):
     X, y = prepare_data(df)
     if y.nunique() < 2:
         return None
-
     model = build_model()
     try:
         cv = cross_val_score(model, X, y, cv=3, scoring="accuracy")
@@ -118,67 +94,41 @@ def evaluate_symbol(sym):
     prob = float(model.predict_proba(X.iloc[-1:].to_numpy())[0][1])
     last_close = df["Close"].iloc[-1]
     atr = df["atr"].iloc[-1] if "atr" in df.columns else last_close * 0.03
+    trend = "Bullish" if prob > 0.55 else "Bearish"
     rec = {
         "Stock": sym.replace(".NS",""),
+        "Trend": trend,
         "Proba": prob,
         "CV": cv_acc,
-        "Entry": last_close,
-        "Target": max(last_close * 1.10, last_close + atr * 2),
-        "Stop": last_close * 0.95,
-        "ATR": atr,
+        "Entry": round(last_close * (1.005 if trend=="Bullish" else 0.995), 2),
+        "Target": round(last_close * (1.1 if trend=="Bullish" else 0.9), 2),
+        "Stop": round(last_close * (0.95 if trend=="Bullish" else 1.05), 2),
+        "ATR": round(atr, 2)
     }
     json.dump(rec, open(cache_file, "w"))
     return rec
 
-
-def chunk(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-
 def main():
-    print("🚀 Starting daily scan...")
-    if not Path("stocks_list.csv").exists():
-        print("❌ Missing stocks_list.csv")
-        return
+    df = pd.read_csv("stocks_list.csv")
+    tickers = [s.strip() + ".NS" if not s.strip().endswith(".NS") else s.strip()
+               for s in df.iloc[:,0].astype(str) if s.strip()]
+    print(f"Scanning {len(tickers)} tickers using {THREADS} threads...")
+    results=[]
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        futures={ex.submit(evaluate_symbol,t):t for t in tickers}
+        for i,f in enumerate(as_completed(futures)):
+            r=f.result()
+            if r: results.append(r)
+            if i%50==0:
+                print(f"{i}/{len(tickers)} done, {len(results)} valid")
+    if results:
+        df=pd.DataFrame(results)
+        df["Score"]=df["Proba"]*(0.6+0.4*df["CV"].fillna(0.5))
+        df=df.sort_values("Score",ascending=False).reset_index(drop=True)
+        df.to_csv(OUTPUT_FILE,index=False)
+        print(f"✅ Saved {len(df)} results to {OUTPUT_FILE}")
+    else:
+        print("⚠️ No results found.")
 
-    tickers = pd.read_csv("stocks_list.csv").iloc[:, 0].astype(str).tolist()
-    tickers = [t.strip() + ".NS" if not t.strip().endswith((".NS",".BO")) else t.strip()
-               for t in tickers if t.strip()]
-    print(f"Loaded {len(tickers)} tickers")
-
-    results = []
-    total = len(tickers)
-    processed = 0
-    start = time.time()
-
-    for batch in chunk(tickers, BATCH_SIZE):
-        for sym in batch:
-            try:
-                res = evaluate_symbol(sym)
-                if res:
-                    results.append(res)
-            except Exception as e:
-                print(f"[{sym}] {e}")
-            processed += 1
-            if processed % 20 == 0:
-                print(f"→ {processed}/{total} processed, {len(results)} valid")
-        time.sleep(SLEEP_BETWEEN_BATCHES)
-
-    if not results:
-        print("⚠️ No valid results found.")
-        return
-
-    df = pd.DataFrame(results)
-    df["Score"] = df["Proba"] * (0.6 + 0.4 * df["CV"].fillna(0.5))
-    df["Potential %"] = (df["Target"] / df["Entry"] - 1) * 100
-    df = df.sort_values("Score", ascending=False).reset_index(drop=True)
-    df.to_csv(OUTPUT_FILE, index=False)
-    top5 = df.head(5)
-    print("✅ Saved:", OUTPUT_FILE)
-    print("\nTop 5 picks:")
-    print(top5[["Stock","Entry","Target","Proba","CV"]])
-    print(f"\nTotal time: {(time.time()-start)/60:.1f} min")
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
